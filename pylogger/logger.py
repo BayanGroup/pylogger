@@ -117,6 +117,56 @@ class UDPStream:
 
 
 # noinspection PyBroadException
+class SafeTcpStream:
+    def __init__(self, host, port):
+        self.host = host
+        self.port = port
+        self.stream = None
+        self.tcp_client = TCPClient()
+        self.make_tcp_connection_loop()
+
+    @gen.coroutine
+    def make_tcp_connection_loop(self, once=False):
+        while True:
+            if self.stream is None:
+                try:
+                    if once:
+                        self.stream = yield gen.with_timeout(
+                            ioloop.IOLoop.instance().time() + ONCE_CONNECT_TIMEOUT,
+                            self.tcp_client.connect(self.host, self.port))
+                    else:
+                        self.stream = yield self.tcp_client.connect(self.host, self.port)
+
+                    if self.stream is not None:
+                        self.stream.set_close_callback(self.disconnected)
+                except Exception:
+                    pass
+            if once:
+                break
+            yield gen.Task(ioloop.IOLoop.instance().add_timeout, ioloop.IOLoop.instance().time() + RECONNECT_INTERVAL)
+
+    def disconnected(self):
+        try:
+            self.stream.close()
+        except Exception:
+            pass
+        self.stream = None
+
+    def write(self, data):
+        if self.stream is not None:
+            return self.stream.write(data)
+
+
+class TcpUdpStream(SafeTcpStream, UDPStream):
+    def __init__(self, host, port):
+        UDPStream.__init__(self, host, port)
+        SafeTcpStream.__init__(self, host, port)
+
+    def write(self, data):
+        (UDPStream if len(data) <= 1472 else SafeTcpStream).write(self, data)
+
+
+# noinspection PyBroadException
 class Logger:
     def __init__(self, transport_uri, logger_data=None):
         """
@@ -149,7 +199,7 @@ class Logger:
 
         if self.transport == 'stdout':
             pass
-        elif self.transport in ['tcp', 'udp']:
+        elif self.transport in ['tcp', 'udp', 'tup']:
             if not self.port and self.out_format == 'syslog':
                 self.port = SYSLOG_PROTOCOL_PORT
             if not self.host:
@@ -158,33 +208,6 @@ class Logger:
                 raise ValueError('Port not specified')
         else:
             raise ValueError('Unknown transport {}'.format(self.transport))
-
-    @gen.coroutine
-    def make_tcp_connection_loop(self, tcp_client, once=False):
-        while True:
-            if self.output_stream is None:
-                try:
-                    if once:
-                        self.output_stream = yield gen.with_timeout(
-                            ioloop.IOLoop.instance().time() + ONCE_CONNECT_TIMEOUT,
-                            tcp_client.connect(self.host, self.port))
-                    else:
-                        self.output_stream = yield tcp_client.connect(self.host, self.port)
-
-                    if self.output_stream is not None:
-                        self.output_stream.set_close_callback(self.disconnected)
-                except Exception:
-                    pass
-            if once:
-                break
-            yield gen.Task(ioloop.IOLoop.instance().add_timeout, ioloop.IOLoop.instance().time() + RECONNECT_INTERVAL)
-
-    def disconnected(self):
-        try:
-            self.output_stream.close()
-        except Exception:
-            pass
-        self.output_stream = None
 
     @gen.coroutine
     def rw_loop(self):
@@ -206,30 +229,30 @@ class Logger:
                 self.current_filename = message[4:-4]
                 continue
 
-            # self.stream is set async and may be None
-            if self.output_stream is not None:
-                utcnow = datetime.utcnow().replace(tzinfo=utc)
-                data_dict = dict(self.logger_data.get_data_for_filename(self.current_filename))
-                data_dict['message'] = message
-                data_dict['timestamp'] = utcnow.isoformat()
-                orig_data_dict = {'timestamp': utcnow}
+            assert self.output_stream is not None, 'Not started yet'
+            utcnow = datetime.utcnow().replace(tzinfo=utc)
+            data_dict = dict(self.logger_data.get_data_for_filename(self.current_filename))
+            data_dict['message'] = message
+            data_dict['timestamp'] = utcnow.isoformat()
+            orig_data_dict = {'timestamp': utcnow}
 
-                data_to_send = self.encode_data(data_dict, orig_data_dict)
+            data_to_send = self.encode_data(data_dict, orig_data_dict)
 
-                try:
-                    yield self.output_stream.write(data_to_send)
-                except Exception:
-                    pass
+            try:
+                yield self.output_stream.write(data_to_send)
+            except Exception:
+                pass
 
     @gen.coroutine
     def start(self):
-        # make first attempt synchronously once
-        tcp_client = None
         if self.transport == 'tcp':
-            tcp_client = TCPClient()
-            yield self.make_tcp_connection_loop(once=True, tcp_client=tcp_client)
+            self.output_stream = SafeTcpStream(self.host, self.port)
+            # make first attempt synchronously once
+            yield self.output_stream.make_tcp_connection_loop(once=True)
         elif self.transport == 'stdout':
             self.output_stream = PipeIOStream(sys.stdout.fileno())
+        elif self.transport == 'tup':
+            self.output_stream = TcpUdpStream(self.host, self.port)
         else:  # udp
             self.output_stream = UDPStream(host=self.host, port=self.port)
 
@@ -237,13 +260,11 @@ class Logger:
 
         # run concurrently asynchronous
         self.rw_loop()
-        if self.transport == 'tcp':
-            self.make_tcp_connection_loop(tcp_client=tcp_client)
 
 
 description = '''
 transport format:
- [stdout|tcp|udp]+[msgpack|json|syslog]://[host][:port]
+ [stdout|tcp|udp|tup]+[msgpack|json|syslog]://[host][:port]
       (ip/port is ignored in stdout transport)
       default host is `localhost`
       port is required (except for syslog)
